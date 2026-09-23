@@ -106,13 +106,19 @@ class ZIPPY_API UZippyCharacterMovementComponent : public UCharacterMovementComp
 
 
 	// Wall Run
+	// Horizontal runs cancel jump/fall momentum and ignore the gravity curve.
+	UPROPERTY(EditDefaultsOnly, Category="Wall Run") bool bWallRunHorizontalOnly = true;
+	// Minimum speed along the wall (cm/s), checked both on entry and during the run.
 	UPROPERTY(EditDefaultsOnly) float MinWallRunSpeed=200.f;
 	UPROPERTY(EditDefaultsOnly) float MaxWallRunSpeed=800.f;
+	// Maximum downward speed (cm/s) for entry, and for continuing a descending wall run.
 	UPROPERTY(EditDefaultsOnly) float MaxVerticalWallRunSpeed=200.f;
 	UPROPERTY(EditDefaultsOnly) float WallRunPullAwayAngle=75;
 	UPROPERTY(EditDefaultsOnly) float WallAttractionForce = 200.f;
 	UPROPERTY(EditDefaultsOnly) float MinWallRunHeight=50.f;
-	UPROPERTY(EditDefaultsOnly) UCurveFloat* WallRunGravityScaleCurve;
+	// Used only for descending runs. X: input/travel alignment (-1 against, 0 none, +1 along).
+	// Y: multiplier of character gravity (0 = none, 1 = full). Missing curve uses full gravity.
+	UPROPERTY(EditDefaultsOnly, meta=(EditCondition="!bWallRunHorizontalOnly")) UCurveFloat* WallRunGravityScaleCurve;
 	UPROPERTY(EditDefaultsOnly) float WallJumpOffForce = 300.f;
 
 	// Hang

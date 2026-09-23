@@ -2,6 +2,7 @@
 
 #include "ZippyCharacter.h"
 #include "Components/CapsuleComponent.h"
+#include "Curves/CurveFloat.h"
 #include "Engine/OverlapResult.h"
 #include "GameFramework/Character.h"
 #include "Net/UnrealNetwork.h"
@@ -1195,7 +1196,7 @@ FVector UZippyCharacterMovementComponent::GetMantleStartLocation(FHitResult Fron
 bool UZippyCharacterMovementComponent::TryWallRun()
 {
 	if (!IsFalling()) return false;
-	if (Velocity.SizeSquared2D() < pow(MinWallRunSpeed, 2)) return false;
+	if (Velocity.SizeSquared2D() < FMath::Square(MinWallRunSpeed)) return false;
 	if (Velocity.Z < -MaxVerticalWallRunSpeed) return false;
 	FVector Start = UpdatedComponent->GetComponentLocation();
 	FVector LeftEnd = Start - UpdatedComponent->GetRightVector() * CapR() * 2;
@@ -1208,9 +1209,13 @@ bool UZippyCharacterMovementComponent::TryWallRun()
 		return false;
 	}
 	
+	// Accept parallel travel as well as motion into the wall. Collision response can
+	// already have removed the inward velocity; still reject motion away after a wall jump.
 	// Left Cast
 	GetWorld()->LineTraceSingleByProfile(WallHit, Start, LeftEnd, "BlockAll", Params);
-	if (WallHit.IsValidBlockingHit() && (Velocity | WallHit.Normal) < 0)
+	if (WallHit.IsValidBlockingHit() && !IsWalkable(WallHit) &&
+		!WallHit.Normal.GetSafeNormal2D().IsNearlyZero() &&
+		(Velocity | WallHit.Normal.GetSafeNormal2D()) <= KINDA_SMALL_NUMBER)
 	{
 		Safe_bWallRunIsRight = false;
 	}
@@ -1218,7 +1223,9 @@ bool UZippyCharacterMovementComponent::TryWallRun()
 	else
 	{
 		GetWorld()->LineTraceSingleByProfile(WallHit, Start, RightEnd, "BlockAll", Params);
-		if (WallHit.IsValidBlockingHit() && (Velocity | WallHit.Normal) < 0)
+		if (WallHit.IsValidBlockingHit() && !IsWalkable(WallHit) &&
+			!WallHit.Normal.GetSafeNormal2D().IsNearlyZero() &&
+			(Velocity | WallHit.Normal.GetSafeNormal2D()) <= KINDA_SMALL_NUMBER)
 		{
 			Safe_bWallRunIsRight = true;
 		}
@@ -1227,12 +1234,14 @@ bool UZippyCharacterMovementComponent::TryWallRun()
 			return false;
 		}
 	}
-	FVector ProjectedVelocity = FVector::VectorPlaneProject(Velocity, WallHit.Normal);
-	if (ProjectedVelocity.SizeSquared2D() < pow(MinWallRunSpeed, 2)) return false;
+	// Use the horizontal wall normal so sloped surfaces cannot turn forward speed into lift.
+	FVector ProjectedVelocity = FVector::VectorPlaneProject(Velocity, WallHit.Normal.GetSafeNormal2D());
+	ProjectedVelocity.Z = 0.f;
+	if (ProjectedVelocity.IsNearlyZero() || ProjectedVelocity.SizeSquared2D() < FMath::Square(MinWallRunSpeed)) return false;
 	
 	// Passed all conditions
 	Velocity = ProjectedVelocity;
-	Velocity.Z = FMath::Clamp(Velocity.Z, 0.f, MaxVerticalWallRunSpeed);
+	// Every run starts level, regardless of the jump/fall velocity before contact.
 	SetMovementMode(MOVE_Custom, CMOVE_WallRun);
 SLOG("Starting WallRun")
 	return true;
@@ -1270,25 +1279,35 @@ void UZippyCharacterMovementComponent::PhysWallRun(float deltaTime, int32 Iterat
 		FHitResult WallHit;
 		GetWorld()->LineTraceSingleByProfile(WallHit, Start, End, "BlockAll", Params);
 		bool bWantsToPullAway = WallHit.IsValidBlockingHit() && !Acceleration.IsNearlyZero() && (Acceleration.GetSafeNormal() | WallHit.Normal) > SinPullAwayAngle;
-		if (!WallHit.IsValidBlockingHit() || bWantsToPullAway)
+		if (!WallHit.IsValidBlockingHit() || IsWalkable(WallHit) ||
+			WallHit.Normal.GetSafeNormal2D().IsNearlyZero() || bWantsToPullAway)
 		{
 			SetMovementMode(MOVE_Falling);
-			StartNewPhysics(remainingTime, Iterations);
+			StartNewPhysics(remainingTime + timeTick, Iterations);
 			return;
 		}
+		const FVector WallNormal = WallHit.Normal.GetSafeNormal2D();
 		// Clamp Acceleration
-		Acceleration = FVector::VectorPlaneProject(Acceleration, WallHit.Normal);
+		Acceleration = FVector::VectorPlaneProject(Acceleration, WallNormal);
 		Acceleration.Z = 0.f;
-		// Apply acceleration
+		// Integrate lateral speed independently so falling speed does not consume the speed limit.
+		const float VerticalSpeed = FMath::Min(Velocity.Z, 0.f);
+		Velocity.Z = 0.f;
 		CalcVelocity(timeTick, 0.f, false, GetMaxBrakingDeceleration());
-		Velocity = FVector::VectorPlaneProject(Velocity, WallHit.Normal);
-		float TangentAccel = Acceleration.GetSafeNormal() | Velocity.GetSafeNormal2D();
-		bool bVelUp = Velocity.Z > 0.f;
-		Velocity.Z += GetGravityZ() * WallRunGravityScaleCurve->GetFloatValue(bVelUp ? 0.f : TangentAccel) * timeTick;
-		if (Velocity.SizeSquared2D() < pow(MinWallRunSpeed, 2) || Velocity.Z < -MaxVerticalWallRunSpeed)
+		Velocity = FVector::VectorPlaneProject(Velocity, WallNormal);
+		Velocity.Z = 0.f;
+		if (!bWallRunHorizontalOnly)
+		{
+			const float TangentAccel = Acceleration.GetSafeNormal() | Velocity.GetSafeNormal2D();
+			const float WallGravityScale = WallRunGravityScaleCurve
+				? FMath::Max(0.f, WallRunGravityScaleCurve->GetFloatValue(TangentAccel)) : 1.f;
+			// Negative curve values must never accelerate a wall run upward.
+			Velocity.Z = FMath::Min(0.f, VerticalSpeed + GetGravityZ() * WallGravityScale * timeTick);
+		}
+		if (Velocity.SizeSquared2D() < FMath::Square(MinWallRunSpeed) || Velocity.Z < -MaxVerticalWallRunSpeed)
 		{
 			SetMovementMode(MOVE_Falling);
-			StartNewPhysics(remainingTime, Iterations);
+			StartNewPhysics(remainingTime + timeTick, Iterations);
 			return;
 		}
 		
@@ -1303,7 +1322,8 @@ void UZippyCharacterMovementComponent::PhysWallRun(float deltaTime, int32 Iterat
 		{
 			FHitResult Hit;
 			SafeMoveUpdatedComponent(Delta, UpdatedComponent->GetComponentQuat(), true, Hit);
-			FVector WallAttractionDelta = -WallHit.Normal * WallAttractionForce * timeTick;
+			// Attraction keeps contact without adding vertical movement on angled walls.
+			FVector WallAttractionDelta = -WallNormal * WallAttractionForce * timeTick;
 			SafeMoveUpdatedComponent(WallAttractionDelta, UpdatedComponent->GetComponentQuat(), true, Hit);
 		}
 		if (UpdatedComponent->GetComponentLocation() == OldLocation)
@@ -1312,6 +1332,7 @@ void UZippyCharacterMovementComponent::PhysWallRun(float deltaTime, int32 Iterat
 			break;
 		}
 		Velocity = (UpdatedComponent->GetComponentLocation() - OldLocation) / timeTick; // v = dx / dt
+		Velocity.Z = bWallRunHorizontalOnly ? 0.f : FMath::Min(Velocity.Z, 0.f);
 	}
 
 	
@@ -1322,7 +1343,7 @@ void UZippyCharacterMovementComponent::PhysWallRun(float deltaTime, int32 Iterat
 	FHitResult FloorHit, WallHit;
 	GetWorld()->LineTraceSingleByProfile(WallHit, Start, End, "BlockAll", Params);
 	GetWorld()->LineTraceSingleByProfile(FloorHit, Start, Start + FVector::DownVector * (CapHH() + MinWallRunHeight * .5f), "BlockAll", Params);
-	if (FloorHit.IsValidBlockingHit() || !WallHit.IsValidBlockingHit() || Velocity.SizeSquared2D() < pow(MinWallRunSpeed, 2))
+	if (FloorHit.IsValidBlockingHit() || !WallHit.IsValidBlockingHit() || Velocity.SizeSquared2D() < FMath::Square(MinWallRunSpeed))
 	{
 		SetMovementMode(MOVE_Falling);
 	}
